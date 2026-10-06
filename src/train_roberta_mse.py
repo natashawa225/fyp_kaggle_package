@@ -77,7 +77,8 @@ def evaluate(model, dataloader, device):
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['label'].to(device)
 
-            logits, _ = model(input_ids, attention_mask)
+            with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
+                logits, _ = model(input_ids, attention_mask)
             all_preds.extend(logits.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 

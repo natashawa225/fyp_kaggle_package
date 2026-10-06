@@ -2,16 +2,46 @@ import json
 import csv
 import os
 import pandas as pd
+import torch
+from torch.utils.data import Dataset
 
 RAW_DIR = "data/raw/ibm_rank_30k"
 PROCESSED_DIR = "data/processed"
+
+class AQADataset(Dataset):
+    def __init__(self, df, tokenizer, max_len=128):
+        topics = df['topic'].astype(str).tolist()
+        arguments = df['argument'].astype(str).tolist()
+        scores = df['quality_score'].astype(float).values
+
+        encodings = tokenizer(
+            topics,
+            arguments,
+            truncation=True,
+            max_length=max_len,
+            padding='max_length',
+            return_tensors='pt'
+        )
+
+        self.input_ids = encodings['input_ids']
+        self.attention_mask = encodings['attention_mask']
+        self.labels = torch.tensor(scores, dtype=torch.float)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return {
+            'input_ids': self.input_ids[idx],
+            'attention_mask': self.attention_mask[idx],
+            'label': self.labels[idx]
+        }
 
 def process_split(json_path, split_name):
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     
     records = []
-    # Handle dict or list structure
     items = data.values() if isinstance(data, dict) else data
     for item in items:
         arg_text = item.get("argument", "").strip()

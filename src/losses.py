@@ -55,7 +55,7 @@ class DistCLLoss(nn.Module):
 
         # Log-softmax over contrastive denominator (all samples k != i)
         # Numerical stability via logsumexp over non-self entries
-        sim_matrix_masked = sim_matrix.masked_fill(mask_self, -1e9)
+        sim_matrix_masked = sim_matrix.masked_fill(mask_self, -1e4)
         log_prob = sim_matrix - torch.logsumexp(sim_matrix_masked, dim=1, keepdim=True)
 
         # Weighted Soft-Contrastive Loss

@@ -8,7 +8,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from scipy.stats import pearsonr, spearmanr, kendalltau
 from sklearn.metrics import mean_absolute_error
-from transformers import AutoTokenizer, AdamW, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from torch.optim import AdamW
 
 from src.dataset import AQADataset
 from src.train_roberta_mse import RoBERTaAQAModel, set_seed, evaluate
@@ -24,12 +25,13 @@ def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl
     val_df = pd.read_csv("data/processed/val.csv")
     test_df = pd.read_csv("data/processed/test.csv")
 
-    train_loader = DataLoader(AQADataset(train_df, tokenizer), batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(AQADataset(val_df, tokenizer), batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(AQADataset(test_df, tokenizer), batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(AQADataset(train_df, tokenizer), batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=True)
+    val_loader = DataLoader(AQADataset(val_df, tokenizer), batch_size=batch_size, shuffle=False, pin_memory=True)
+    test_loader = DataLoader(AQADataset(test_df, tokenizer), batch_size=batch_size, shuffle=False, pin_memory=True)
 
     model = RoBERTaAQAModel(model_name).to(device)
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
     
     mse_criterion = nn.MSELoss()
     distcl_criterion = DistCLLoss(temperature=tau, sigma=sigma, kernel_type=kernel_type)
@@ -52,16 +54,17 @@ def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl
             labels = batch['label'].to(device)
 
             optimizer.zero_grad()
-            logits, cls_rep = model(input_ids, attention_mask)
+            with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
+                logits, cls_rep = model(input_ids, attention_mask)
+                loss_mse = mse_criterion(logits, labels)
+                loss_cl = distcl_criterion(cls_rep, labels)
+                loss = loss_mse + lambda_cl * loss_cl
 
-            loss_mse = mse_criterion(logits, labels)
-            loss_cl = distcl_criterion(cls_rep, labels)
-
-            loss = loss_mse + lambda_cl * loss_cl
-
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             total_loss += loss.item()
