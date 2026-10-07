@@ -45,7 +45,7 @@ class AQADataset(Dataset):
         }
 
 class RoBERTaAQAModel(nn.Module):
-    def __init__(self, model_name='roberta-base'):
+    def __init__(self, model_name='roberta-base', use_proj=False, proj_dim=128):
         super(RoBERTaAQAModel, self).__init__()
         self.encoder = AutoModel.from_pretrained(model_name)
         hidden_size = self.encoder.config.hidden_size
@@ -53,11 +53,21 @@ class RoBERTaAQAModel(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden_size, 1)
         )
+        self.use_proj = use_proj
+        if self.use_proj:
+            self.projection_head = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, proj_dim)
+            )
 
     def forward(self, input_ids, attention_mask):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         cls_rep = outputs.last_hidden_state[:, 0, :] # [CLS] embedding
         logits = self.regressor(cls_rep).squeeze(-1)
+        if self.use_proj:
+            cl_rep = self.projection_head(cls_rep)
+            return logits, cl_rep
         return logits, cls_rep
 
 def set_seed(seed):
@@ -77,7 +87,7 @@ def evaluate(model, dataloader, device):
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['label'].to(device)
 
-            with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
                 logits, _ = model(input_ids, attention_mask)
             all_preds.extend(logits.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())

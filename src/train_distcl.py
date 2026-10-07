@@ -17,10 +17,10 @@ from src.dataset import AQADataset
 from src.train_roberta_mse import RoBERTaAQAModel, set_seed, evaluate
 from src.losses import DistCLLoss
 
-def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl, sigma, tau, kernel_type):
+def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl, sigma, tau, kernel_type, use_proj):
     set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n================ Training DistCL Seed {seed} | Kernel: {kernel_type} | σ={sigma}, τ={tau} | λ={lambda_cl} ================")
+    print(f"\n================ Training DistCL Seed {seed} | Kernel: {kernel_type} | Proj: {use_proj} | σ={sigma}, τ={tau} | λ={lambda_cl} ================")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     train_df = pd.read_csv("data/processed/train.csv")
@@ -31,9 +31,9 @@ def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl
     val_loader = DataLoader(AQADataset(val_df, tokenizer), batch_size=batch_size, shuffle=False, pin_memory=True)
     test_loader = DataLoader(AQADataset(test_df, tokenizer), batch_size=batch_size, shuffle=False, pin_memory=True)
 
-    model = RoBERTaAQAModel(model_name).to(device)
+    model = RoBERTaAQAModel(model_name, use_proj=use_proj).to(device)
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
     
     mse_criterion = nn.MSELoss()
     distcl_criterion = DistCLLoss(temperature=tau, sigma=sigma, kernel_type=kernel_type)
@@ -56,10 +56,10 @@ def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl
             labels = batch['label'].to(device)
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
-                logits, cls_rep = model(input_ids, attention_mask)
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                logits, cl_rep = model(input_ids, attention_mask)
                 loss_mse = mse_criterion(logits, labels)
-                loss_cl = distcl_criterion(cls_rep, labels)
+                loss_cl = distcl_criterion(cl_rep, labels)
                 loss = loss_mse + lambda_cl * loss_cl
 
             scaler.scale(loss).backward()
@@ -92,13 +92,14 @@ def main():
     parser.add_argument("--lambda_cl", type=float, default=0.1)
     parser.add_argument("--sigma", type=float, default=0.15)
     parser.add_argument("--tau", type=float, default=0.07)
+    parser.add_argument("--use_proj", action="store_true", help="Use 2-layer projection head for contrastive loss")
     parser.add_argument("--kernel_type", type=str, default="gaussian", choices=["gaussian", "exponential"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 123, 456])
     args = parser.parse_args()
 
     all_seed_results = []
     for seed in args.seeds:
-        res = train_single_seed_distcl(seed, args.model_name, args.epochs, args.batch_size, args.lr, args.lambda_cl, args.sigma, args.tau, args.kernel_type)
+        res = train_single_seed_distcl(seed, args.model_name, args.epochs, args.batch_size, args.lr, args.lambda_cl, args.sigma, args.tau, args.kernel_type, args.use_proj)
         all_seed_results.append(res)
 
     pearson_scores = [r["pearson"] for r in all_seed_results]
