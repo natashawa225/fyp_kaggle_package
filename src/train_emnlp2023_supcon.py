@@ -63,10 +63,14 @@ def train_single_seed_emnlp(seed, model_name, epochs, batch_size, lr, lambda_cl,
                 loss = loss_mse + lambda_cl * loss_cl
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            try:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            except ValueError:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             scheduler.step()
 
             total_loss += loss.item()
