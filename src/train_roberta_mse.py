@@ -1,135 +1,47 @@
 import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import json
 import argparse
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from scipy.stats import pearsonr, spearmanr, kendalltau
-from sklearn.metrics import mean_absolute_error
-
-# HuggingFace Transformers
-from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 
-class AQADataset(Dataset):
-    def __init__(self, df, tokenizer, max_len=128):
-        self.df = df.reset_index(drop=True)
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+from src.dataset import AQADataset
+from src.model import RoBERTaAQAModel, set_seed
+from src.metrics import evaluate, print_evaluation_summary
 
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        topic = str(row['topic'])
-        argument = str(row['argument'])
-        score = float(row['quality_score'])
-
-        # Input format: [CLS] Topic [SEP] Argument [SEP]
-        encoding = self.tokenizer(
-            topic,
-            argument,
-            truncation=True,
-            max_length=self.max_len,
-            padding='max_length',
-            return_tensors='pt'
-        )
-
-        return {
-            'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0),
-            'label': torch.tensor(score, dtype=torch.float)
-        }
-
-class RoBERTaAQAModel(nn.Module):
-    def __init__(self, model_name='roberta-base', use_proj=False, proj_dim=128):
-        super(RoBERTaAQAModel, self).__init__()
-        self.encoder = AutoModel.from_pretrained(model_name)
-        hidden_size = self.encoder.config.hidden_size
-        self.regressor = nn.Sequential(
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size, 1)
-        )
-        self.use_proj = use_proj
-        if self.use_proj:
-            self.projection_head = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
-                nn.ReLU(),
-                nn.Linear(hidden_size, proj_dim)
-            )
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        cls_rep = outputs.last_hidden_state[:, 0, :] # [CLS] embedding
-        logits = self.regressor(cls_rep).squeeze(-1)
-        if self.use_proj:
-            cl_rep = self.projection_head(cls_rep)
-            return logits, cl_rep
-        return logits, cls_rep
-
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-def evaluate(model, dataloader, device):
-    model.eval()
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['label'].to(device)
-
-            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
-                logits, _ = model(input_ids, attention_mask)
-            all_preds.extend(logits.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    preds = np.array(all_preds)
-    labels = np.array(all_labels)
-
-    pearson_r, _ = pearsonr(labels, preds)
-    spearman_r, _ = spearmanr(labels, preds)
-    kendall_t, _ = kendalltau(labels, preds)
-    mae = mean_absolute_error(labels, preds)
-
-    return {
-        "pearson": float(pearson_r),
-        "spearman": float(spearman_r),
-        "kendall_tau": float(kendall_t),
-        "mae": float(mae)
-    }
-
-def train_single_seed(seed, model_name, epochs, batch_size, lr):
-    set_seed(seed)
+def train_single_seed(seed, model_name, epochs, batch_size, lr, checkpoint_dir, deterministic=False):
+    set_seed(seed, deterministic=deterministic)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n================ Training Seed {seed} on {device} ================")
+    print(f"\n================ Training RoBERTa MSE | Seed {seed} on {device} ================")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     train_df = pd.read_csv("data/processed/train.csv")
     val_df = pd.read_csv("data/processed/val.csv")
     test_df = pd.read_csv("data/processed/test.csv")
 
-    train_loader = DataLoader(AQADataset(train_df, tokenizer), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(AQADataset(val_df, tokenizer), batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(AQADataset(test_df, tokenizer), batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(AQADataset(train_df, tokenizer), batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=True)
+    val_loader = DataLoader(AQADataset(val_df, tokenizer), batch_size=batch_size, shuffle=False, pin_memory=True)
+    test_loader = DataLoader(AQADataset(test_df, tokenizer), batch_size=batch_size, shuffle=False, pin_memory=True)
 
     model = RoBERTaAQAModel(model_name).to(device)
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
     criterion = nn.MSELoss()
 
     total_steps = len(train_loader) * epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps*0.1), num_training_steps=total_steps)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.1), num_training_steps=total_steps)
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    ckpt_path = os.path.join(checkpoint_dir, f"model_seed{seed}.pt")
 
     best_val_pearson = -1.0
-    best_test_metrics = None
+    best_val_metrics = None
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -141,25 +53,42 @@ def train_single_seed(seed, model_name, epochs, batch_size, lr):
             labels = batch['label'].to(device)
 
             optimizer.zero_grad()
-            logits, _ = model(input_ids, attention_mask)
-            loss = criterion(logits, labels)
+            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                logits, _ = model(input_ids, attention_mask)
+                loss = criterion(logits, labels)
 
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.scale(loss).backward()
+            try:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            except ValueError:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             scheduler.step()
 
             total_loss += loss.item()
 
         val_metrics = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch}/{epochs} - Loss: {total_loss/len(train_loader):.4f} | Val Pearson: {val_metrics['pearson']:.4f}, Spearman: {val_metrics['spearman']:.4f}")
+        print(f"Epoch {epoch}/{epochs} - Loss: {total_loss/len(train_loader):.4f} | Val Pearson: {val_metrics['global_pearson']:.4f}, Val Spearman: {val_metrics['global_spearman']:.4f}")
 
-        if val_metrics['pearson'] > best_val_pearson:
-            best_val_pearson = val_metrics['pearson']
-            best_test_metrics = evaluate(model, test_loader, device)
-            print(f"--> Best Val Model Updated! Test Pearson: {best_test_metrics['pearson']:.4f}, Spearman: {best_test_metrics['spearman']:.4f}")
+        if val_metrics['global_pearson'] > best_val_pearson:
+            best_val_pearson = val_metrics['global_pearson']
+            best_val_metrics = val_metrics
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"--> Saved Best Checkpoint (Val Pearson: {best_val_pearson:.4f}) to {ckpt_path}")
 
-    return best_test_metrics
+    # Load best checkpoint for test evaluation
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    test_metrics = evaluate(model, test_loader, device)
+    print_evaluation_summary(test_metrics, title=f"TEST METRICS (Seed {seed})")
+
+    return {
+        "seed": seed,
+        "best_val_metrics": best_val_metrics,
+        "test_metrics": test_metrics
+    }
 
 def main():
     parser = argparse.ArgumentParser()
@@ -167,37 +96,60 @@ def main():
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--seeds", nargs="+", type=int, default=[42, 123, 456])
+    parser.add_argument("--seeds", nargs="+", type=int, default=[42, 123, 456, 789, 1011])
+    parser.add_argument("--output", type=str, default="results/roberta_mse.json")
+    parser.add_argument("--checkpoint_dir", type=str, default="results/checkpoints/roberta_mse")
+    parser.add_argument("--deterministic", action="store_true")
     args = parser.parse_args()
 
     all_seed_results = []
     for seed in args.seeds:
-        res = train_single_seed(seed, args.model_name, args.epochs, args.batch_size, args.lr)
+        res = train_single_seed(seed, args.model_name, args.epochs, args.batch_size, args.lr, args.checkpoint_dir, args.deterministic)
         all_seed_results.append(res)
 
-    pearson_scores = [r["pearson"] for r in all_seed_results]
-    spearman_scores = [r["spearman"] for r in all_seed_results]
-    mae_scores = [r["mae"] for r in all_seed_results]
+    def extract_metric(res_list, metric_key):
+        return [r["test_metrics"][metric_key] for r in res_list]
 
     summary = {
+        "model_variant": "RoBERTa_MSE",
+        "model_name": args.model_name,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
         "seeds": args.seeds,
-        "pearson_mean": float(np.mean(pearson_scores)),
-        "pearson_std": float(np.std(pearson_scores)),
-        "spearman_mean": float(np.mean(spearman_scores)),
-        "spearman_std": float(np.std(spearman_scores)),
-        "mae_mean": float(np.mean(mae_scores)),
-        "mae_std": float(np.std(mae_scores)),
+        "global_pearson_mean": float(np.mean(extract_metric(all_seed_results, "global_pearson"))),
+        "global_pearson_std": float(np.std(extract_metric(all_seed_results, "global_pearson"))),
+        "global_spearman_mean": float(np.mean(extract_metric(all_seed_results, "global_spearman"))),
+        "global_spearman_std": float(np.std(extract_metric(all_seed_results, "global_spearman"))),
+        "per_topic_macro_pearson_mean": float(np.mean(extract_metric(all_seed_results, "per_topic_macro_pearson"))),
+        "per_topic_macro_pearson_std": float(np.std(extract_metric(all_seed_results, "per_topic_macro_pearson"))),
+        "per_topic_macro_spearman_mean": float(np.mean(extract_metric(all_seed_results, "per_topic_macro_spearman"))),
+        "per_topic_macro_spearman_std": float(np.std(extract_metric(all_seed_results, "per_topic_macro_spearman"))),
+        "per_topic_weighted_pearson_mean": float(np.mean(extract_metric(all_seed_results, "per_topic_weighted_pearson"))),
+        "per_topic_weighted_pearson_std": float(np.std(extract_metric(all_seed_results, "per_topic_weighted_pearson"))),
+        "per_topic_weighted_spearman_mean": float(np.mean(extract_metric(all_seed_results, "per_topic_weighted_spearman"))),
+        "per_topic_weighted_spearman_std": float(np.std(extract_metric(all_seed_results, "per_topic_weighted_spearman"))),
+        "mae_mean": float(np.mean(extract_metric(all_seed_results, "mae"))),
+        "mae_std": float(np.std(extract_metric(all_seed_results, "mae"))),
+        "rmse_mean": float(np.mean(extract_metric(all_seed_results, "rmse"))),
+        "rmse_std": float(np.std(extract_metric(all_seed_results, "rmse"))),
         "all_seed_results": all_seed_results
     }
 
     print("\n================ FINAL SUMMARY (RoBERTa MSE) ================")
-    print(f"Pearson:  {summary['pearson_mean']:.4f} ± {summary['pearson_std']:.4f}")
-    print(f"Spearman: {summary['spearman_mean']:.4f} ± {summary['spearman_std']:.4f}")
-    print(f"MAE:      {summary['mae_mean']:.4f} ± {summary['mae_std']:.4f}")
+    print(f"Global Pearson:              {summary['global_pearson_mean']:.4f} ± {summary['global_pearson_std']:.4f}")
+    print(f"Global Spearman:             {summary['global_spearman_mean']:.4f} ± {summary['global_spearman_std']:.4f}")
+    print(f"Per-Topic Macro Pearson:     {summary['per_topic_macro_pearson_mean']:.4f} ± {summary['per_topic_macro_pearson_std']:.4f}")
+    print(f"Per-Topic Macro Spearman:    {summary['per_topic_macro_spearman_mean']:.4f} ± {summary['per_topic_macro_spearman_std']:.4f}")
+    print(f"Per-Topic Weighted Pearson:  {summary['per_topic_weighted_pearson_mean']:.4f} ± {summary['per_topic_weighted_pearson_std']:.4f}")
+    print(f"Per-Topic Weighted Spearman: {summary['per_topic_weighted_spearman_mean']:.4f} ± {summary['per_topic_weighted_spearman_std']:.4f}")
+    print(f"MAE:                         {summary['mae_mean']:.4f} ± {summary['mae_std']:.4f}")
+    print(f"RMSE:                        {summary['rmse_mean']:.4f} ± {summary['rmse_std']:.4f}")
 
-    os.makedirs("results", exist_ok=True)
-    with open("results/roberta_mse_summary.json", "w") as f:
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    with open(args.output, "w") as f:
         json.dump(summary, f, indent=2)
+    print(f"Saved results to {args.output}")
 
 if __name__ == "__main__":
     main()

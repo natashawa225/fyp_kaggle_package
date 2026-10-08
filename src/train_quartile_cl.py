@@ -13,13 +13,13 @@ from torch.optim import AdamW
 
 from src.dataset import AQADataset
 from src.model import RoBERTaAQAModel, set_seed
-from src.losses import DistCLLoss
+from src.losses import QuartileSupConLoss
 from src.metrics import evaluate, print_evaluation_summary
 
-def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl, sigma, tau, kernel_type, use_proj, checkpoint_dir, deterministic=False):
+def train_single_seed_quartile_cl(seed, model_name, epochs, batch_size, lr, alpha, beta, tau, use_proj, checkpoint_dir, deterministic=False):
     set_seed(seed, deterministic=deterministic)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n================ Training DistCL | Seed {seed} | Kernel: {kernel_type} | σ={sigma}, τ={tau} | λ={lambda_cl} ================")
+    print(f"\n================ Training Quartile CL (Wang et al. 2023) | Seed {seed} | α={alpha}, β={beta}, τ={tau} ================")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     train_df = pd.read_csv("data/processed/train.csv")
@@ -35,7 +35,7 @@ def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
     mse_criterion = nn.MSELoss()
-    distcl_criterion = DistCLLoss(temperature=tau, sigma=sigma, kernel_type=kernel_type)
+    quartile_cl_criterion = QuartileSupConLoss(temperature=tau, alpha=alpha)
 
     total_steps = len(train_loader) * epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.1), num_training_steps=total_steps)
@@ -61,8 +61,8 @@ def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl
             with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
                 logits, cl_rep = model(input_ids, attention_mask)
                 loss_mse = mse_criterion(logits, labels)
-                loss_cl = distcl_criterion(cl_rep, labels)
-                loss = loss_mse + lambda_cl * loss_cl
+                loss_cl = quartile_cl_criterion(cl_rep, labels)
+                loss = beta * loss_cl + (1.0 - beta) * loss_mse
 
             scaler.scale(loss).backward()
             try:
@@ -91,7 +91,7 @@ def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl
     # Load best checkpoint for test evaluation
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     test_metrics = evaluate(model, test_loader, device)
-    print_evaluation_summary(test_metrics, title=f"TEST METRICS (DistCL {kernel_type.upper()} Seed {seed})")
+    print_evaluation_summary(test_metrics, title=f"TEST METRICS (Quartile CL Seed {seed})")
 
     return {
         "seed": seed,
@@ -105,27 +105,21 @@ def main():
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--lambda_cl", type=float, default=0.1)
-    parser.add_argument("--sigma", type=float, default=0.15)
-    parser.add_argument("--tau", type=float, default=0.07)
-    parser.add_argument("--use_proj", action="store_true", help="Use 2-layer projection head for contrastive loss")
-    parser.add_argument("--kernel_type", type=str, default="gaussian", choices=["gaussian", "exponential", "linear"])
+    parser.add_argument("--alpha", type=float, default=0.5)
+    parser.add_argument("--beta", type=float, default=0.8)
+    parser.add_argument("--tau", type=float, default=0.1)
+    parser.add_argument("--use_proj", action="store_true")
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 123, 456, 789, 1011])
-    parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--checkpoint_dir", type=str, default=None)
+    parser.add_argument("--output", type=str, default="results/quartile_cl.json")
+    parser.add_argument("--checkpoint_dir", type=str, default="results/checkpoints/quartile_cl")
     parser.add_argument("--deterministic", action="store_true")
     args = parser.parse_args()
 
-    if args.output is None:
-        args.output = f"results/distcl_{args.kernel_type}.json"
-    if args.checkpoint_dir is None:
-        args.checkpoint_dir = f"results/checkpoints/distcl_{args.kernel_type}"
-
     all_seed_results = []
     for seed in args.seeds:
-        res = train_single_seed_distcl(
+        res = train_single_seed_quartile_cl(
             seed, args.model_name, args.epochs, args.batch_size, args.lr,
-            args.lambda_cl, args.sigma, args.tau, args.kernel_type, args.use_proj,
+            args.alpha, args.beta, args.tau, args.use_proj,
             args.checkpoint_dir, args.deterministic
         )
         all_seed_results.append(res)
@@ -134,11 +128,10 @@ def main():
         return [r["test_metrics"][metric_key] for r in res_list]
 
     summary = {
-        "model_variant": f"DistCL_{args.kernel_type.upper()}",
-        "kernel_type": args.kernel_type,
-        "sigma": args.sigma,
+        "model_variant": "Quartile_CL",
+        "alpha": args.alpha,
+        "beta": args.beta,
         "tau": args.tau,
-        "lambda_cl": args.lambda_cl,
         "use_proj": args.use_proj,
         "model_name": args.model_name,
         "epochs": args.epochs,
@@ -164,7 +157,7 @@ def main():
         "all_seed_results": all_seed_results
     }
 
-    print(f"\n================ FINAL SUMMARY (DistCL {args.kernel_type.upper()}) ================")
+    print("\n================ FINAL SUMMARY (Quartile CL) ================")
     print(f"Global Pearson:              {summary['global_pearson_mean']:.4f} ± {summary['global_pearson_std']:.4f}")
     print(f"Global Spearman:             {summary['global_spearman_mean']:.4f} ± {summary['global_spearman_std']:.4f}")
     print(f"Per-Topic Macro Pearson:     {summary['per_topic_macro_pearson_mean']:.4f} ± {summary['per_topic_macro_pearson_std']:.4f}")

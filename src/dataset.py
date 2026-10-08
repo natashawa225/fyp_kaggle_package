@@ -10,31 +10,29 @@ PROCESSED_DIR = "data/processed"
 
 class AQADataset(Dataset):
     def __init__(self, df, tokenizer, max_len=128):
-        topics = df['topic'].astype(str).tolist()
-        arguments = df['argument'].astype(str).tolist()
-        scores = df['quality_score'].astype(float).values
+        self.df = df.reset_index(drop=True)
+        self.topics = self.df['topic'].astype(str).tolist()
+        self.arguments = self.df['argument'].astype(str).tolist()
+        self.scores = self.df['quality_score'].astype(float).values
 
-        encodings = tokenizer(
-            topics,
-            arguments,
+        self.encodings = tokenizer(
+            self.topics,
+            self.arguments,
             truncation=True,
             max_length=max_len,
             padding='max_length',
             return_tensors='pt'
         )
 
-        self.input_ids = encodings['input_ids']
-        self.attention_mask = encodings['attention_mask']
-        self.labels = torch.tensor(scores, dtype=torch.float)
-
     def __len__(self):
-        return len(self.labels)
+        return len(self.scores)
 
     def __getitem__(self, idx):
         return {
-            'input_ids': self.input_ids[idx],
-            'attention_mask': self.attention_mask[idx],
-            'label': self.labels[idx]
+            'input_ids': self.encodings['input_ids'][idx],
+            'attention_mask': self.encodings['attention_mask'][idx],
+            'label': torch.tensor(self.scores[idx], dtype=torch.float),
+            'topic': self.topics[idx]
         }
 
 def process_split(json_path, split_name):

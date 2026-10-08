@@ -13,7 +13,7 @@ class DistCLLoss(nn.Module):
     Hyperparameters:
         temperature (tau): float - Softmax scaling factor
         sigma: float - RBF kernel distance bandwidth parameter
-        kernel_type: str - 'gaussian' or 'exponential'
+        kernel_type: str - 'gaussian', 'exponential', or 'linear'
     """
     def __init__(self, temperature=0.07, sigma=0.15, kernel_type="gaussian"):
         super(DistCLLoss, self).__init__()
@@ -56,7 +56,6 @@ class DistCLLoss(nn.Module):
         w_norm = w / w_sum # (N, N)
 
         # Log-softmax over contrastive denominator (all samples k != i)
-        # Numerical stability via logsumexp over non-self entries
         sim_matrix_masked = sim_matrix.masked_fill(mask_self, -1e4)
         log_prob = sim_matrix - torch.logsumexp(sim_matrix_masked, dim=1, keepdim=True)
 
@@ -70,12 +69,17 @@ class DistCLLoss(nn.Module):
 class QuartileSupConLoss(nn.Module):
     """
     EMNLP 2023 Quartile-Based Supervised Contrastive Loss (Wang et al., 2023)
-    Discretizes sorted batch into 4 quartiles B1, B2, B3, B4.
+    Discretizes sorted batch of size N into 4 quartiles B1, B2, B3, B4.
     Uses B2 and B3 as anchors.
+    Positives: same quartile.
+    Negatives: all arguments outside anchor's quartile.
+    
+    Loss = alpha * L_cl^B2 + (1 - alpha) * L_cl^B3
     """
-    def __init__(self, temperature=0.1):
+    def __init__(self, temperature=0.1, alpha=0.5):
         super(QuartileSupConLoss, self).__init__()
         self.temperature = temperature
+        self.alpha = alpha
 
     def forward(self, features, labels):
         device = features.device
@@ -83,10 +87,13 @@ class QuartileSupConLoss(nn.Module):
         if N < 4:
             return torch.tensor(0.0, device=device, requires_grad=True)
 
+        # 1. Normalize features to unit hypersphere
         z = F.normalize(features, dim=1)
+
+        # 2. Pairwise Cosine Similarity / tau
         sim_matrix = torch.matmul(z, z.T) / self.temperature
 
-        # Sort batch by true label
+        # 3. Sort batch by true label descending
         sorted_indices = torch.argsort(labels, descending=True)
         n_q = N // 4
         if n_q == 0:
@@ -96,27 +103,39 @@ class QuartileSupConLoss(nn.Module):
         b2_idx = sorted_indices[n_q : 2 * n_q]
         b3_idx = sorted_indices[2 * n_q : 3 * n_q]
 
-        def compute_subset_loss(anchor_indices):
-            loss_sum = 0.0
-            count = 0
+        mask_self = torch.eye(N, dtype=torch.bool, device=device)
+
+        def compute_quartile_loss(anchor_indices):
+            anchor_losses = []
             for i in anchor_indices:
-                # Positives are other samples in the same quartile
+                # Positives: other samples in the same quartile
                 pos_mask = torch.zeros(N, dtype=torch.bool, device=device)
                 pos_mask[anchor_indices] = True
                 pos_mask[i] = False # remove self
 
-                if pos_mask.sum() == 0:
+                num_pos = pos_mask.sum().item()
+                if num_pos == 0:
                     continue
 
-                pos_sim = sim_matrix[i, pos_mask]
-                all_sim = sim_matrix[i, torch.arange(N, device=device) != i]
+                # Denominator: logsumexp over all k != i
+                all_sim_i = sim_matrix[i].masked_fill(mask_self[i], -1e4)
+                log_denom = torch.logsumexp(all_sim_i, dim=0)
 
-                log_prob = torch.logsumexp(pos_sim, dim=0) - torch.logsumexp(all_sim, dim=0)
-                loss_sum -= log_prob
-                count += 1
-            return loss_sum / max(count, 1)
+                # Positives numerator: S_ip - log_denom for each positive p
+                pos_sim_i = sim_matrix[i, pos_mask]
+                log_prob_p = pos_sim_i - log_denom
 
-        l_b2 = compute_subset_loss(b2_idx)
-        l_b3 = compute_subset_loss(b3_idx)
+                # Average over positive pairs for anchor i
+                loss_i = -log_prob_p.mean()
+                anchor_losses.append(loss_i)
 
-        return 0.5 * (l_b2 + l_b3)
+            if not anchor_losses:
+                return torch.tensor(0.0, device=device, requires_grad=True)
+
+            return torch.stack(anchor_losses).mean()
+
+        l_b2 = compute_quartile_loss(b2_idx)
+        l_b3 = compute_quartile_loss(b3_idx)
+
+        loss_cl = self.alpha * l_b2 + (1.0 - self.alpha) * l_b3
+        return loss_cl
