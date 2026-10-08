@@ -16,10 +16,12 @@ from src.model import RoBERTaAQAModel, set_seed
 from src.losses import DistCLLoss
 from src.metrics import evaluate, print_evaluation_summary
 
-def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl, sigma, tau, kernel_type, use_proj, checkpoint_dir, deterministic=False):
+def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, beta, lambda_cl, sigma, tau, kernel_type, use_proj, checkpoint_dir, deterministic=False):
     set_seed(seed, deterministic=deterministic)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n================ Training DistCL | Seed {seed} | Kernel: {kernel_type} | σ={sigma}, τ={tau} | λ={lambda_cl} ================")
+    
+    loss_str = f"β={beta} (Loss = {beta}*CL + {1.0-beta:.2f}*MSE)" if beta is not None else f"λ={lambda_cl} (Loss = MSE + {lambda_cl}*CL)"
+    print(f"\n================ Training DistCL | Seed {seed} | Kernel: {kernel_type} | σ={sigma}, τ={tau} | {loss_str} ================")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     train_df = pd.read_csv("data/processed/train.csv")
@@ -62,7 +64,10 @@ def train_single_seed_distcl(seed, model_name, epochs, batch_size, lr, lambda_cl
                 logits, cl_rep = model(input_ids, attention_mask)
                 loss_mse = mse_criterion(logits, labels)
                 loss_cl = distcl_criterion(cl_rep, labels)
-                loss = loss_mse + lambda_cl * loss_cl
+                if beta is not None:
+                    loss = beta * loss_cl + (1.0 - beta) * loss_mse
+                else:
+                    loss = loss_mse + lambda_cl * loss_cl
 
             scaler.scale(loss).backward()
             try:
@@ -105,9 +110,10 @@ def main():
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--lambda_cl", type=float, default=0.1)
+    parser.add_argument("--beta", type=float, default=0.8, help="Weight for contrastive loss: beta*CL + (1-beta)*MSE (default: 0.8)")
+    parser.add_argument("--lambda_cl", type=float, default=None, help="Additive weight for contrastive loss (if beta is set to None)")
     parser.add_argument("--sigma", type=float, default=0.15)
-    parser.add_argument("--tau", type=float, default=0.07)
+    parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--use_proj", action="store_true", help="Use 2-layer projection head for contrastive loss")
     parser.add_argument("--kernel_type", type=str, default="gaussian", choices=["gaussian", "exponential", "linear"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 123, 456, 789, 1011])
@@ -115,6 +121,10 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--deterministic", action="store_true")
     args = parser.parse_args()
+
+    # If lambda_cl is explicitly provided and user wants additive form:
+    if args.lambda_cl is not None and "--beta" not in sys.argv:
+        args.beta = None
 
     if args.output is None:
         args.output = f"results/distcl_{args.kernel_type}.json"
@@ -125,7 +135,7 @@ def main():
     for seed in args.seeds:
         res = train_single_seed_distcl(
             seed, args.model_name, args.epochs, args.batch_size, args.lr,
-            args.lambda_cl, args.sigma, args.tau, args.kernel_type, args.use_proj,
+            args.beta, args.lambda_cl, args.sigma, args.tau, args.kernel_type, args.use_proj,
             args.checkpoint_dir, args.deterministic
         )
         all_seed_results.append(res)
@@ -138,6 +148,7 @@ def main():
         "kernel_type": args.kernel_type,
         "sigma": args.sigma,
         "tau": args.tau,
+        "beta": args.beta,
         "lambda_cl": args.lambda_cl,
         "use_proj": args.use_proj,
         "model_name": args.model_name,
