@@ -97,7 +97,7 @@ def main():
     parser.add_argument("--sigma", type=float, default=0.15)
     parser.add_argument("--tau", type=float, default=0.07)
     parser.add_argument("--use_proj", action="store_true", help="Use 2-layer projection head for contrastive loss")
-    parser.add_argument("--kernel_type", type=str, default="gaussian", choices=["gaussian", "exponential"])
+    parser.add_argument("--kernel_type", type=str, default="gaussian", choices=["gaussian", "exponential", "linear"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 123, 456])
     args = parser.parse_args()
 

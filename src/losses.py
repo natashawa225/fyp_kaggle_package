@@ -42,6 +42,8 @@ class DistCLLoss(nn.Module):
             w = torch.exp(-(label_diffs ** 2) / (2 * (self.sigma ** 2)))
         elif self.kernel_type == "exponential":
             w = torch.exp(-label_diffs / self.sigma)
+        elif self.kernel_type == "linear":
+            w = torch.clamp(1.0 - label_diffs, min=0.0)
         else:
             raise ValueError(f"Unknown kernel type: {self.kernel_type}")
 
